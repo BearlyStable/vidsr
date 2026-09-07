@@ -43,7 +43,7 @@ except ImportError:  # pragma: no cover
     sys.exit("OpenCV missing: pip install 'numpy>=1.24' 'opencv-python-headless>=4.8'")
 
 PROG = "vidsr"
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # --------------------------------------------------------------------------
 # small utilities
@@ -1710,6 +1710,14 @@ def apply_preset(a, parser: argparse.ArgumentParser) -> None:
             setattr(a, k, v)
 
 
+def cmd_ui(a) -> int:
+    try:
+        import vidsr_ui
+    except ImportError as e:                       # pragma: no cover
+        die(f"could not load the UI ({e}); the CLI and `vidsr select` still work")
+    return vidsr_ui.run_app(a.video, a.out)
+
+
 def cmd_sr(a) -> int:
     t0 = _time.time()
     info, spec, window, roi, ref_idx, excluded, ref_time, exclude_times = _resolve_job(a)
@@ -2030,6 +2038,7 @@ def cmd_sr(a) -> int:
 
 WORKFLOW = """\
 typical session
+  0  vidsr ui    cam.mkv                                  # desktop window, or:
   1  vidsr info  cam.mkv
   2  vidsr grid  cam.mkv --start 0 --end 2:00            # find the moment
   3  vidsr select cam.mkv --start 47 --dur 3 --out work  # opens a picker UI
@@ -2165,6 +2174,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--no-variants", action="store_true")
     g.add_argument("--mem-limit", type=float, default=6.0, help="max stack size in GB")
     pr.set_defaults(func=cmd_sr)
+
+    pu = sub.add_parser("ui", help="desktop window for selecting and running")
+    pu.add_argument("video", nargs="?", help="open this file straight away")
+    pu.add_argument("--out", default="out")
+    pu.set_defaults(func=cmd_ui)
+
     p.set_defaults(_sr_parser=pr)
     return p
 

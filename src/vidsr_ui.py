@@ -92,11 +92,6 @@ def build_args(sel: Selection) -> list:
     return args
 
 
-def command_line(sel: Selection) -> str:
-    import shlex
-    return "vidsr " + " ".join(shlex.quote(a) for a in build_args(sel)[0:1] + build_args(sel)[1:])
-
-
 def run_selection(sel: Selection, on_progress=None) -> dict:
     """Run the reconstruction in-process and return its report."""
     parser = vidsr.build_parser()
@@ -110,6 +105,44 @@ def run_selection(sel: Selection, on_progress=None) -> dict:
         vidsr.set_progress(None)
     with open(os.path.join(sel.out, "report.json")) as fh:
         return json.load(fh)
+
+
+# ---------------------------------------------------------------------------
+# geometry (pure, and therefore testable without a display)
+# ---------------------------------------------------------------------------
+
+
+def fit_view(src_w: int, src_h: int, view_w: int, view_h: int):
+    """Letterbox a frame into the canvas: (scale, x offset, y offset)."""
+    s = min(view_w / max(1, src_w), view_h / max(1, src_h))
+    dw, dh = max(1, int(src_w * s)), max(1, int(src_h * s))
+    return s, (view_w - dw) // 2, (view_h - dh) // 2
+
+
+def view_to_source(cx: float, cy: float, disp):
+    """Canvas point -> source pixel. Getting this wrong picks the wrong ROI."""
+    s, ox, oy = disp
+    return (cx - ox) / s, (cy - oy) / s
+
+
+def source_to_view(x: float, y: float, disp):
+    s, ox, oy = disp
+    return x * s + ox, y * s + oy
+
+
+def rect_from_drag(p0, p1):
+    """Two source-space points -> an (x, y, w, h) rect, dragged any direction."""
+    (x0, y0), (x1, y1) = p0, p1
+    return (int(min(x0, x1)), int(min(y0, y1)),
+            max(2, int(abs(x1 - x0))), max(2, int(abs(y1 - y0))))
+
+
+def time_to_x(t: float, dur: float, width: int) -> float:
+    return (t / max(1e-9, dur)) * max(1, width)
+
+
+def x_to_time(x: float, dur: float, width: int) -> float:
+    return max(0.0, min(dur, x / max(1, width) * dur))
 
 
 # ---------------------------------------------------------------------------
@@ -341,10 +374,9 @@ class App:
 
     def show_frame(self, bgr):
         h, w = bgr.shape[:2]
-        s = min(self.VIEW_W / w, self.VIEW_H / h)
-        dw, dh = max(1, int(w * s)), max(1, int(h * s))
-        img = cv2.resize(bgr, (dw, dh), interpolation=cv2.INTER_AREA)
-        ox, oy = (self.VIEW_W - dw) // 2, (self.VIEW_H - dh) // 2
+        s, ox, oy = fit_view(w, h, self.VIEW_W, self.VIEW_H)
+        img = cv2.resize(bgr, (max(1, int(w * s)), max(1, int(h * s))),
+                         interpolation=cv2.INTER_AREA)
         self.disp = (s, ox, oy)
         self.photo = _photo(img)
         self.canvas.delete("all")
@@ -366,8 +398,7 @@ class App:
 
     # -- ROI ---------------------------------------------------------------
     def to_src(self, cx, cy):
-        s, ox, oy = self.disp
-        return (cx - ox) / s, (cy - oy) / s
+        return view_to_source(cx, cy, self.disp)
 
     def on_press(self, e):
         if self.disp:
@@ -376,10 +407,7 @@ class App:
     def on_move(self, e):
         if not self.drag:
             return
-        x0, y0 = self.drag
-        x1, y1 = self.to_src(e.x, e.y)
-        self.sel.roi = (int(min(x0, x1)), int(min(y0, y1)),
-                        max(2, int(abs(x1 - x0))), max(2, int(abs(y1 - y0))))
+        self.sel.roi = rect_from_drag(self.drag, self.to_src(e.x, e.y))
         self.draw_roi()
 
     def on_release(self, e):
@@ -393,9 +421,10 @@ class App:
         self.canvas.delete("roi")
         if not (self.sel.roi and self.disp):
             return
-        s, ox, oy = self.disp
         x, y, w, h = self.sel.roi
-        self.canvas.create_rectangle(ox + x * s, oy + y * s, ox + (x + w) * s, oy + (y + h) * s,
+        vx0, vy0 = source_to_view(x, y, self.disp)
+        vx1, vy1 = source_to_view(x + w, y + h, self.disp)
+        self.canvas.create_rectangle(vx0, vy0, vx1, vy1,
                                      outline="#4da3ff", width=2, tags="roi")
         self.roi_lbl.configure(text=f"{w} × {h} px at {x},{y}", foreground="#000")
         key = round(self.cur_t, 2)
@@ -458,11 +487,11 @@ class App:
     # -- timeline ----------------------------------------------------------
     def tl_x(self, t):
         dur = (self.info.duration if self.info else 1.0) or 1.0
-        return (t / dur) * max(1, self.timeline.winfo_width())
+        return time_to_x(t, dur, self.timeline.winfo_width())
 
     def tl_t(self, x):
         dur = (self.info.duration if self.info else 1.0) or 1.0
-        return max(0.0, min(dur, x / max(1, self.timeline.winfo_width()) * dur))
+        return x_to_time(x, dur, self.timeline.winfo_width())
 
     def draw_timeline(self):
         c = self.timeline

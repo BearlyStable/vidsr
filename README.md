@@ -47,7 +47,33 @@ assumptions:
 For faces it is worth being explicit: recovering *detail* is not the same as
 establishing *identity*. This tool can sharpen a face it cannot identify.
 
-## Workflow
+## The window
+
+```bash
+vidsr ui cam.mkv          # or just `vidsr ui` and open a file from there
+```
+
+One window that does the whole job: scrub the video, drag a box around the
+subject, drag on the timeline to set the range to use, shift-drag to mark spans
+to ignore (the two minutes where someone walked through), say whether the
+subject is still or moving, and hit Run. A progress bar tracks the
+reconstruction and the result appears in the next tab, alongside the
+side-by-side comparison and the sharpening variants.
+
+It is a front end for the CLI and nothing more — **Copy CLI command** gives you
+the exact equivalent line, so anything you set up in the window can be re-run on
+a headless box.
+
+Tk is a separate package on most distributions:
+
+```bash
+sudo apt install python3-tk        # Debian / Kali / Ubuntu
+sudo dnf install python3-tkinter   # Fedora
+```
+
+Without it the UI prints that hint and exits; everything below still works.
+
+## Command line
 
 ```bash
 vidsr info   cam.mkv                                  # fps, codec, interlacing
@@ -57,7 +83,9 @@ xdg-open work/select.html
 vidsr sr     cam.mkv --select selection.json --out out
 ```
 
-### 1. `select` — choosing what to use
+### `select` — the browser-based picker
+
+An alternative to the window that needs no Tk at all, useful over SSH.
 
 `select.html` is a self-contained page (no server, works over `file://`):
 
@@ -79,7 +107,7 @@ headless box is not blocked:
 vidsr sr cam.mkv --roi 812,430,96,34 --use 10:00-15:00 --skip 12:30-14:30 --out out
 ```
 
-### 2. `sr` — the reconstruction
+### `sr` — the reconstruction
 
 Reads the selection, aligns, rejects the frames that do not belong, fuses,
 back-projects, deconvolves, and writes to `--out`:

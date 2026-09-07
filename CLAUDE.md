@@ -24,8 +24,12 @@ python -m venv .venv && .venv/bin/pip install -e .
 ```
 
 Requires `ffmpeg`/`ffprobe` on PATH. Runtime deps are only numpy + OpenCV.
-`node` is optional (one test uses `node --check` on the generated UI and skips
-without it).
+`node` is optional (one test uses `node --check` on the generated HTML picker
+and skips without it). Tk is optional too: `vidsr ui` needs `python3-tk`, and
+prints how to install it when missing. **The Tk window itself cannot be tested
+here** — no display, and no Xvfb — so changes to widget wiring need the user to
+run `vidsr ui` and say what happened. Keep logic out of the widgets and in the
+pure helpers, which are tested.
 
 ## Working agreement
 
@@ -46,7 +50,8 @@ without it).
 ## Layout
 
 ```
-src/vidsr.py            the whole tool, one module (~2000 lines)
+src/vidsr.py            the pipeline and CLI (~2100 lines)
+src/vidsr_ui.py         optional Tk desktop UI (~700 lines)
 tests/run_tests.py      the suite: unit + end-to-end, no pytest needed
 tools/make_test_video.py  renders synthetic clips with a known ground truth
 .github/workflows/ci.yml       tests on 3.9/3.11/3.13 + build check
@@ -82,6 +87,18 @@ These were all found the hard way; a unit test guards each one.
   Index-based exclusions are a CLI convenience only.
 - **The decode window may always shrink to ROI + pad**, because cropping does
   not change frame indexing — only spans, stride, deint and max-frames do.
+- **Never assume the size of a decoded frame.** ffmpeg's crop rounds odd sizes
+  *and* odd offsets down to even on chroma-subsampled formats, and rotation
+  metadata or anamorphic SAR change the size too — all silently. Reshaping the
+  raw pipe at the wrong width shears every frame into a parallelogram with no
+  error anywhere. `probe_filtered_size` measures what the filter chain really
+  emits and that measurement wins; windows are snapped even, and crop is passed
+  `exact=1`. If you add a filter, keep the measurement.
+- **The UI has no second code path.** `vidsr_ui` builds a `vidsr sr ...`
+  argument list and hands it to the real parser, which is what makes the window
+  and the headless CLI equivalent. Do not let it call pipeline internals
+  directly — its geometry helpers are pure and tested, but nothing else about a
+  window can be checked automatically.
 
 ## Domain facts worth keeping in mind
 

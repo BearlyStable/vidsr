@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vidsr"
-version = "0.1.0"
+version = "0.2.0"
 description = "Multi-frame super-resolution for video: fuse many frames of one region into a single sharper image"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -44,7 +44,7 @@ Issues = "https://github.com/BearlyStable/vidsr/issues"
 vidsr = "vidsr:main"
 
 [tool.setuptools]
-py-modules = ["vidsr"]
+py-modules = ["vidsr", "vidsr_ui"]
 
 [tool.setuptools.package-dir]
 "" = "src"

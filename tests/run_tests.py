@@ -459,6 +459,138 @@ def t_js():
     print("      picker JS parses, timeline + span export present")
 
 
+@test("ui/selection-builds-a-valid-command")
+def t_ui_args():
+    """The UI has no second code path: it builds a CLI argument list and hands
+    it to vidsr's own parser. That contract is what makes the headless and
+    windowed workflows equivalent, so test it without needing a display."""
+    import vidsr_ui as ui
+
+    sel = ui.Selection(video="cam.mkv", roi=(812, 430, 96, 34), start=600.0,
+                       end=900.0, skips=[(750.0, 870.0)], preset="static",
+                       scale=4, max_frames=250, out="out")
+    args = ui.build_args(sel)
+    assert args[:2] == ["sr", "cam.mkv"], args
+    for flag, val in (("--roi", "812,430,96,34"), ("--use", "600.000-900.000"),
+                      ("--skip", "750.000-870.000"), ("--preset", "static"),
+                      ("--scale", "4"), ("--max-frames", "250")):
+        assert flag in args and args[args.index(flag) + 1] == val, f"{flag} wrong in {args}"
+
+    # vidsr's own parser must accept it, and read back what the UI meant
+    parser = ps.build_parser()
+    a = parser.parse_args(args)
+    ps.apply_preset(a, a._sr_parser)
+    eq(a.roi, "812,430,96,34", "roi")
+    eq(a.preset, "static", "preset")
+    eq(a.motion, "translation", "preset must reach the reconstruction settings")
+    eq(ps.parse_spans(a.use, 1e9), [(600.0, 900.0)], "use span")
+    eq(ps.subtract_spans(ps.parse_spans(a.use, 1e9), ps.parse_spans(a.skip, 1e9)),
+       [(600.0, 750.0), (870.0, 900.0)], "skip must cut the middle out")
+    eq(sel.spans(), [(600.0, 750.0), (870.0, 900.0)], "Selection.spans")
+
+    # and it must refuse a selection that cannot run, rather than build nonsense
+    for bad, why in ((ui.Selection(video="c.mkv", start=0, end=5), "no roi"),
+                     (ui.Selection(video="c.mkv", roi=(1, 2, 3, 4), start=5, end=5), "empty range"),
+                     (ui.Selection(roi=(1, 2, 3, 4), start=0, end=5), "no video")):
+        try:
+            ui.build_args(bad)
+            raise AssertionError(f"accepted a selection with {why}")
+        except ValueError:
+            pass
+    print("      builds and round-trips through the real parser")
+
+
+@test("ui/coordinate-mapping")
+def t_ui_geom():
+    """Canvas-to-source mapping decides which pixels get reconstructed. The
+    window cannot be driven headlessly, so at least pin the maths."""
+    import vidsr_ui as ui
+
+    disp = ui.fit_view(1920, 1080, 780, 440)
+    s, ox, oy = disp
+    # 780/1920 < 440/1080, so width is the binding constraint here
+    assert abs(s - 780 / 1920) < 1e-9, s
+    assert ox == 0 and oy >= 0, (ox, oy)          # letterboxed top and bottom
+
+    for pt in [(0, 0), (1919, 1079), (960, 540), (17, 933)]:
+        vx, vy = ui.source_to_view(*pt, disp)
+        bx, by = ui.view_to_source(vx, vy, disp)
+        assert abs(bx - pt[0]) < 0.01 and abs(by - pt[1]) < 0.01, (pt, bx, by)
+
+    # the corners of the displayed image map to the corners of the frame
+    x0, y0 = ui.view_to_source(ox, oy, disp)
+    assert abs(x0) < 0.01 and abs(y0) < 0.01, (x0, y0)
+
+    # a drag maps to the same rect whichever way it is pulled
+    a, b = (100.0, 50.0), (140.0, 80.0)
+    eq(ui.rect_from_drag(a, b), (100, 50, 40, 30), "drag rect")
+    eq(ui.rect_from_drag(b, a), (100, 50, 40, 30), "reversed drag must match")
+    assert ui.rect_from_drag((10, 10), (10, 10))[2] >= 2, "degenerate drag must stay usable"
+
+    # a portrait video letterboxes the other way
+    s2, ox2, oy2 = ui.fit_view(1080, 1920, 780, 440)
+    assert ox2 > 0 and oy2 == 0 and s2 < 1, (s2, ox2, oy2)
+
+    for dur, width in ((300.0, 800), (7.5, 640)):
+        for t in (0.0, dur / 3, dur):
+            assert abs(ui.x_to_time(ui.time_to_x(t, dur, width), dur, width) - t) < 1e-6
+    eq(ui.x_to_time(-50, 10.0, 100), 0.0, "clamps left")
+    eq(ui.x_to_time(9999, 10.0, 100), 10.0, "clamps right")
+    print("      round-trips landscape, portrait and timeline mapping")
+
+
+@test("ui/progress-reaches-one")
+def t_progress(fresh=False):
+    """The progress bar is only honest if the callback actually advances."""
+    p = build_clip("static", fresh)
+    seen = []
+    ps.set_progress(lambda f, m: seen.append((f, m)))
+    try:
+        rep = run_sr(p, "--roi", ",".join(map(str, roi_of(p))), "--use", "0-2",
+                     "--max-frames", 20, "--scale", 2, "--ibp", 2, "--no-variants",
+                     out=os.path.join(WORK, "out_prog"))
+    finally:
+        ps.set_progress(None)
+    # run_sr shells out, so this process sees nothing - the callback is only
+    # meaningful in-process, which is how the UI drives it
+    eq(seen, [], "a subprocess run must not call our callback")
+
+    import vidsr_ui as ui
+    seen.clear()
+    sel = ui.Selection(video=p["path"], roi=roi_of(p), start=0.0, end=2.0,
+                       preset="static", scale=2, max_frames=20,
+                       out=os.path.join(WORK, "out_uirun"))
+    rep = ui.run_selection(sel, lambda f, m: seen.append((f, m)))
+    assert seen, "no progress reported"
+    fracs = [f for f, _ in seen]
+    assert fracs == sorted(fracs), f"progress went backwards: {fracs}"
+    assert 0.0 <= fracs[0] and fracs[-1] == 1.0, f"progress ended at {fracs[-1]}"
+    assert len(seen) >= 5, f"only {len(seen)} updates - the bar would jump"
+    assert rep["frames_used"] >= 2, "the UI path must actually reconstruct"
+    assert os.path.exists(rep["outputs"]["result"]), "no result written"
+    # and the hook must be off again afterwards
+    seen.clear()
+    ps.progress(0.5, "should go nowhere")
+    eq(seen, [], "callback outlived the run")
+    print(f"      {len(fracs)} updates, {fracs[0]:.2f} -> {fracs[-1]:.2f}, "
+          f"{rep['frames_used']} frames fused")
+
+
+@test("ui/imports-without-a-display")
+def t_ui_headless():
+    """Importing the UI must not need Tk or a display: a headless box has to be
+    able to run the tests and the CLI."""
+    import subprocess as sp
+    code = ("import os, sys; os.environ.pop('DISPLAY', None); "
+            "sys.path.insert(0, %r); import vidsr_ui; "
+            "print('ok', callable(vidsr_ui.build_args), callable(vidsr_ui.run_app))"
+            % os.path.join(ROOT, "src"))
+    r = sp.run([PY, "-c", code], capture_output=True, text=True, env=ENV)
+    eq(r.returncode, 0, f"import failed headless:\n{r.stderr}")
+    assert r.stdout.strip() == "ok True True", r.stdout
+    print("      imports with no DISPLAY")
+
+
 @test("e2e/selection-json-drives-sr")
 def t_selection(fresh=False):
     """What the UI exports must reproduce end-to-end, spans and all."""

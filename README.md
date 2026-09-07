@@ -16,16 +16,46 @@ video.
 
 ## Install
 
+vidsr needs two things from your system: **ffmpeg** (it shells out to it) and,
+only if you want the desktop window, **Tk**.
+
 ```bash
-pip install vidsr
+# Debian / Kali / Ubuntu
+sudo apt install ffmpeg pipx python3-tk
+pipx install vidsr
+
+# Fedora
+sudo dnf install ffmpeg python3-tkinter
+pipx install vidsr
 ```
 
-You also need **ffmpeg** on `PATH` (`apt install ffmpeg` / `dnf install ffmpeg`).
-Everything else is numpy and OpenCV. No GPU, no model weights, and no network
-access at any point — your footage never leaves the machine.
+`pipx` is the right tool here — it puts vidsr in its own environment and still
+puts the `vidsr` command on your PATH. On Kali and other recent Debian systems
+`pip install vidsr` is refused outright (the system Python is marked
+externally-managed), so pipx or a virtualenv is the only way.
 
-<sub>vidsr depends on `opencv-python-headless`. If you already have
-`opencv-python` and want to keep it, install with
+To upgrade later:
+
+```bash
+pipx upgrade vidsr
+```
+
+`python3-tk` is optional and only needed for `vidsr ui`; everything else works
+without it. It can be installed before or after vidsr — Tk lives in the system
+Python, and the isolated environment picks it up either way.
+
+For the newest code, ahead of whatever is on PyPI:
+
+```bash
+pipx install --force "git+https://github.com/BearlyStable/vidsr.git"
+```
+
+No GPU, no model weights, and no network access at any point — your footage
+never leaves the machine.
+
+<sub>vidsr depends on `opencv-python-headless`. Under pipx that is isolated and
+cannot disturb an existing `opencv-python`. If you are installing into a shared
+environment that already has `opencv-python`, use
 `pip install --no-deps vidsr numpy` instead.</sub>
 
 ## What it works on
@@ -64,14 +94,8 @@ It is a front end for the CLI and nothing more — **Copy CLI command** gives yo
 the exact equivalent line, so anything you set up in the window can be re-run on
 a headless box.
 
-Tk is a separate package on most distributions:
-
-```bash
-sudo apt install python3-tk        # Debian / Kali / Ubuntu
-sudo dnf install python3-tkinter   # Fedora
-```
-
-Without it the UI prints that hint and exits; everything below still works.
+If Tk is missing the command prints the one-line fix for your distribution and
+exits; everything below still works without it.
 
 ## Command line
 
@@ -204,6 +228,15 @@ vidsr sr cam.mkv --select selection.json --preset moving   # subject crosses the
 git clone https://github.com/BearlyStable/vidsr && cd vidsr
 python -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/python tests/run_tests.py           # ~2 min
+```
+
+The suite needs `ffmpeg`. It also exercises the desktop window on a throwaway X
+server when `python3-tk` and `Xvfb` are present, and skips that one test when
+they are not:
+
+```bash
+sudo apt install python3-tk xvfb          # Debian / Kali
+sudo dnf install python3-tkinter xorg-x11-server-Xvfb
 ```
 
 The tests render synthetic clips from a known ground truth — a plate whose text

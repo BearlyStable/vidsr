@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""
+Regression tests for vidsr.
+
+Synthetic clips are rendered from a known ground truth, so every claim the tool
+makes can be checked numerically instead of by eye: the reconstruction must
+correlate with the true plate better than a plain bicubic upscale does, and the
+frames a pedestrian walks through must actually get rejected.
+
+    python tests/run_tests.py            # all of them
+    python tests/run_tests.py -k static  # just the matching ones
+    python tests/run_tests.py --fresh    # re-encode the clips
+    python tests/run_tests.py --keep     # keep outputs for a look
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import traceback
+
+import cv2
+import numpy as np
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+
+import make_test_video as gen          # noqa: E402
+import vidsr as ps                     # noqa: E402
+
+PY = sys.executable
+ENV = dict(os.environ, PYTHONPATH=os.path.join(ROOT, "src")
+           + os.pathsep + os.environ.get("PYTHONPATH", ""))
+# run the module, so the tests work against a checkout or an install alike
+TOOL = ["-m", "vidsr"]
+WORK = os.environ.get("VIDSR_TESTDIR") or os.path.join(ROOT, ".testwork")
+
+TESTS: list[tuple[str, callable]] = []
+
+
+def test(name):
+    def deco(fn):
+        TESTS.append((name, fn))
+        return fn
+    return deco
+
+
+def eq(got, want, what=""):
+    assert got == want, f"{what}: got {got!r}, want {want!r}"
+
+
+def ge(got, want, what=""):
+    assert got >= want, f"{what}: got {got:.4f}, need >= {want:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# scenarios
+# ---------------------------------------------------------------------------
+
+SCENARIOS = {
+    # a parked car under a fixed camera: no object motion, only mount shake
+    "static": dict(plate="MKX 8317", plate_px=44, dx=0.0, dy=0.0, zoom_rate=0.0,
+                   jitter=0.35, noise=7.0, frames=200, occlude="60-95",
+                   bitrate="900k", width=960, height=540, fps=25),
+    # a rigid mount with no shake at all: the hardest case, no sub-pixel diversity
+    "rigid": dict(plate="MKX 8317", plate_px=44, dx=0.0, dy=0.0, zoom_rate=0.0,
+                  jitter=0.0, noise=7.0, frames=120, occlude="", bitrate="900k",
+                  width=960, height=540, fps=25),
+    # a car driving past: real sub-pixel sampling, the classic SR win
+    "moving": dict(plate="MKX 8317", plate_px=52, dx=0.9, dy=0.28, zoom_rate=0.0004,
+                   jitter=0.25, noise=6.0, frames=110, occlude="", bitrate="1200k",
+                   width=960, height=540, fps=25),
+}
+
+
+def clip_path(name: str) -> str:
+    return os.path.join(WORK, f"{name}.mkv")
+
+
+def build_clip(name: str, fresh: bool = False) -> dict:
+    p = SCENARIOS[name]
+    out = clip_path(name)
+    if fresh or not os.path.exists(out):
+        os.makedirs(WORK, exist_ok=True)
+        cmd = [PY, os.path.join(ROOT, "tools", "make_test_video.py"), "--out", out,
+               "--plate", p["plate"], "--plate-px", str(p["plate_px"]),
+               "--dx", str(p["dx"]), "--dy", str(p["dy"]),
+               "--zoom-rate", str(p["zoom_rate"]), "--jitter", str(p["jitter"]),
+               "--noise", str(p["noise"]), "--frames", str(p["frames"]),
+               "--bitrate", p["bitrate"], "--fps", str(p["fps"]),
+               "--width", str(p["width"]), "--height", str(p["height"]),
+               "--occlude", p["occlude"]]
+        r = subprocess.run(cmd, capture_output=True, text=True, env=ENV)
+        assert r.returncode == 0, f"clip generation failed:\n{r.stdout}\n{r.stderr}"
+    return dict(p, path=out, name=name)
+
+
+def mo_of(p) -> dict:
+    return {"dx": p["dx"], "dy": p["dy"], "zoom": p["zoom_rate"]}
+
+
+def roi_of(p, t=0.0) -> tuple[int, int, int, int]:
+    return gen.plate_roi_video(p["width"], p["height"], t, mo_of(p), p["plate_px"])
+
+
+def run_sr(p, *args, out=None) -> dict:
+    out = out or os.path.join(WORK, f"out_{p['name']}")
+    shutil.rmtree(out, ignore_errors=True)
+    cmd = [PY, *TOOL, "sr", p["path"], "--out", out, *[str(x) for x in args]]
+    r = subprocess.run(cmd, capture_output=True, text=True, env=ENV)
+    assert r.returncode == 0, f"sr failed:\n{' '.join(cmd)}\n{r.stdout}\n{r.stderr}"
+    rep = json.load(open(os.path.join(out, "report.json")))
+    rep["_stdout"], rep["_stderr"], rep["_dir"] = r.stdout, r.stderr, out
+    return rep
+
+
+def truth_for(p, report, margin_src=3) -> np.ndarray:
+    """The ideal plate image at output scale, with a margin for the shift search."""
+    t_index = report["reference_time"] * p["fps"]
+    hi = gen.render(p["width"], p["height"], t_index, p["plate"], None,
+                    mo_of(p), p["plate_px"])
+    S = gen.S
+    wx, wy = report["window"][0], report["window"][1]
+    rx, ry, rw, rh = report["roi_out"]
+    x0, y0 = wx + rx - margin_src, wy + ry - margin_src
+    w, h = rw + 2 * margin_src, rh + 2 * margin_src
+    crop = hi[int(y0 * S):int((y0 + h) * S), int(x0 * S):int((x0 + w) * S)]
+    scale = report["scale"]
+    crop = cv2.resize(crop, (int(round(w * scale)), int(round(h * scale))),
+                      interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+
+
+def match_score(img_path: str, truth: np.ndarray, sub: int = 4) -> float:
+    """Best normalised correlation against the ground truth.
+
+    Both images are upsampled by `sub` with the same kernel before matching, so
+    the search resolves 1/sub-pixel offsets. Without that, the reference frame's
+    own camera shake leaves a random sub-pixel residual and the score wobbles by
+    ~0.01 for reasons that have nothing to do with the reconstruction.
+    """
+    im = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+    assert im is not None, f"cannot read {img_path}"
+    tmpl = im.astype(np.float32) / 255.0
+    if tmpl.shape[0] > truth.shape[0] or tmpl.shape[1] > truth.shape[1]:
+        tmpl = tmpl[:truth.shape[0], :truth.shape[1]]
+    tu = cv2.resize(truth, None, fx=sub, fy=sub, interpolation=cv2.INTER_CUBIC)
+    mu = cv2.resize(tmpl, None, fx=sub, fy=sub, interpolation=cv2.INTER_CUBIC)
+    return float(cv2.matchTemplate(tu, mu, cv2.TM_CCOEFF_NORMED).max())
+
+
+def scores(p, report) -> tuple[float, float, float]:
+    truth = truth_for(p, report)
+    out = report["_dir"]
+    tag = f"x{report['scale']:g}"
+    base = match_score(os.path.join(out, f"02_baseline_bicubic_{tag}.png"), truth)
+    fused = match_score(os.path.join(out, f"03_fused_{tag}.png"), truth)
+    final = match_score(os.path.join(out, f"05_result_{tag}.png"), truth)
+    return base, fused, final
+
+
+# ---------------------------------------------------------------------------
+# unit tests
+# ---------------------------------------------------------------------------
+
+
+@test("units/time-and-span-parsing")
+def t_spans():
+    eq(ps.parse_time("12.5"), 12.5)
+    eq(ps.parse_time("1:02.5"), 62.5)
+    eq(ps.parse_time("00:01:02.5"), 62.5)
+    eq(ps.parse_span("10:00-15:00", 999), (600.0, 900.0))
+    eq(ps.parse_span("10:00+2:00", 999), (600.0, 720.0))
+    eq(ps.parse_span("-30", 999), (0.0, 30.0))
+    eq(ps.parse_span("2:00-", 900), (120.0, 900.0))
+    eq(ps.merge_spans([(0, 5), (4, 8), (20, 22)]), [(0, 8), (20, 22)])
+    # "take these five minutes, ignore two of them in the middle"
+    eq(ps.subtract_spans([(600, 900)], [(700, 820)]), [(600, 700), (820, 900)])
+    eq(ps.subtract_spans([(0, 10)], [(0, 10)]), [])
+    eq(ps.subtract_spans([(0, 10)], [(20, 30)]), [(0, 10)])
+    eq(ps.spans_total([(0, 10), (20, 25)]), 15.0)
+    eq(ps.parse_index_list("3-5,9"), {3, 4, 5, 9})
+    eq(ps.parse_rect("10,20,30,40"), (10, 20, 30, 40))
+
+
+@test("units/warp-round-trip")
+def t_warp():
+    """LR->HR and HR->LR must be exact inverses, or back-projection diverges."""
+    rng = np.random.default_rng(0)
+    lr = rng.random((40, 60), np.float32)
+    W = np.array([[1, 0, 2.37], [0, 1, -1.15]], np.float32)   # ref -> frame
+    T = ps.hr_transform((5, 4, 20, 12), 4.0)
+    hr = ps.warp_lr_to_hr(lr, W, T, (80, 48))
+    back = ps.warp_hr_to_lr(hr, W, T, (60, 40))
+    # the HR grid only covers the ROI (window x 5..25, y 4..16) shifted by W,
+    # so score strictly inside that overlap
+    m = np.zeros_like(lr, bool)
+    m[7:14, 9:21] = True
+    r = ps.ncc(lr, back, m)
+    assert back[30:, :].max() == 0, "warp wrote outside the covered region"
+    ge(r, 0.97, "round-trip correlation")
+
+
+@test("units/ncc-and-fusion")
+def t_fuse():
+    rng = np.random.default_rng(1)
+    a = rng.random((20, 20), np.float32)
+    m = np.ones_like(a, bool)
+    ge(ps.ncc(a, a, m), 0.999, "self correlation")
+    assert abs(ps.ncc(a, a * 0.5 + 0.2, m) - 1.0) < 1e-3, "ncc must ignore gain/offset"
+    # a trimmed mean has to survive a few wildly wrong frames
+    truth = np.full((1, 8, 8, 1), 0.5, np.float32)
+    stack = np.repeat(truth, 12, axis=0)
+    stack[3] = 1.0
+    stack[7] = 0.0
+    out, cov = ps.fuse(stack, np.ones(12, np.float32), "trimmed", 0.25)
+    assert abs(float(out.mean()) - 0.5) < 0.02, f"trimmed mean broke: {out.mean()}"
+    eq(float(cov.min()), 12.0, "coverage")
+
+
+@test("units/selection-json-round-trip")
+def t_specjson():
+    spec = ps.DecodeSpec(spans=[(1.5, 3.0), (10.0, 12.0)], window=(1, 2, 30, 40),
+                         deint="field", step=2, max_frames=99)
+    back = ps.DecodeSpec.from_json(json.loads(json.dumps(spec.to_json())))
+    eq(back.spans, [(1.5, 3.0), (10.0, 12.0)])
+    eq(back.window, (1, 2, 30, 40))
+    eq(back.deint, "field")
+    eq(back.max_frames, 99)
+
+
+# ---------------------------------------------------------------------------
+# end-to-end
+# ---------------------------------------------------------------------------
+
+
+@test("e2e/static-parked-car")
+def t_static(fresh=False):
+    p = build_clip("static", fresh)
+    roi = roi_of(p)
+    rep = run_sr(p, "--roi", ",".join(map(str, roi)), "--preset", "static",
+                 "--scale", 4, "--use", "0-8", "--max-frames", 120, "--ibp", 8)
+    base, fused, final = scores(p, rep)
+    print(f"      bicubic {base:.3f} -> fused {fused:.3f} -> result {final:.3f}"
+          f"   ({rep['frames_used']}/{rep['frames_decoded']} frames)")
+    ge(final, base + 0.010, "result must beat bicubic")
+    ge(final, 0.86, "absolute quality")
+    ge(rep["frames_used"] / rep["frames_decoded"], 0.4, "kept fraction")
+
+
+@test("e2e/static-rejects-occlusion")
+def t_reject(fresh=False):
+    """The pedestrian frames must be thrown out without being told about them."""
+    p = build_clip("static", fresh)
+    rep = run_sr(p, "--roi", ",".join(map(str, roi_of(p))), "--preset", "static",
+                 "--scale", 4, "--use", "0-8", "--ref", 0, "--max-frames", 200,
+                 "--ibp", 4, "--no-variants")
+    a, b = (int(v) for v in SCENARIOS["static"]["occlude"].split("-"))
+    fps, mo, ppx = p["fps"], mo_of(p), p["plate_px"]
+
+    def cover(f):
+        """How much of the plate the walker hides in this frame (0 when away)."""
+        i = f["t"] * fps
+        if not (a <= i <= b):
+            return 0.0
+        return gen.plate_occlusion(p["width"], p["height"], i, mo, ppx,
+                                   (i - a) / float(b - a))
+
+    hidden = [f for f in rep["frames"] if cover(f) > 0.25]   # really covered
+    clear = [f for f in rep["frames"] if cover(f) == 0.0]    # walker not on the plate
+    assert hidden and clear, "test bug: no frames in one of the groups"
+    dropped = sum(1 for f in hidden if not f["used"])
+    lost = sum(1 for f in clear if not f["used"])
+    print(f"      hidden {dropped}/{len(hidden)} dropped, "
+          f"clear frames lost {lost}/{len(clear)}")
+    ge(dropped / len(hidden), 0.85, "covered frames must be rejected")
+    assert lost / len(clear) < 0.15, f"good frames thrown away: {lost}/{len(clear)}"
+
+
+@test("e2e/moving-car")
+def t_moving(fresh=False):
+    p = build_clip("moving", fresh)
+    rep = run_sr(p, "--roi", ",".join(map(str, roi_of(p, 0))), "--ref", 0,
+                 "--preset", "moving", "--scale", 4, "--use", "0-3",
+                 "--max-frames", 75, "--ibp", 10)
+    base, fused, final = scores(p, rep)
+    print(f"      bicubic {base:.3f} -> fused {fused:.3f} -> result {final:.3f}"
+          f"   ({rep['frames_used']}/{rep['frames_decoded']} frames, "
+          f"phase cov {rep['phase_coverage']*100:.0f}%)")
+    ge(final, base + 0.008, "result must beat bicubic")
+    ge(final, 0.88, "absolute quality")
+
+
+@test("e2e/rigid-mount-no-jitter")
+def t_rigid(fresh=False):
+    """Zero camera shake: no sub-pixel diversity to exploit. The tool must still
+    produce a sane image (noise averaging + deconvolution) and say so honestly."""
+    p = build_clip("rigid", fresh)
+    rep = run_sr(p, "--roi", ",".join(map(str, roi_of(p))), "--preset", "static",
+                 "--scale", 4, "--use", "0-4", "--max-frames", 80, "--ibp", 6,
+                 "--no-variants")
+    base, fused, final = scores(p, rep)
+    print(f"      bicubic {base:.3f} -> fused {fused:.3f} -> result {final:.3f}"
+          f"   (phase cov {rep['phase_coverage']*100:.0f}%)")
+    ge(final, base, "must not be worse than bicubic")
+    ge(final, 0.86, "absolute quality")
+
+
+@test("e2e/time-spans-are-honoured")
+def t_skip(fresh=False):
+    """--use / --skip must decide which seconds are read at all."""
+    p = build_clip("static", fresh)
+    rep = run_sr(p, "--roi", ",".join(map(str, roi_of(p))), "--use", "0-8",
+                 "--skip", "2.4-3.8", "--scale", 3, "--ibp", 2, "--no-variants",
+                 "--max-frames", 60)
+    ts = [f["t"] for f in rep["frames"]]
+    # the boundaries themselves are kept: the cut is the open interval
+    inside = [t for t in ts if 2.4 < t < 3.8]
+    eq(inside, [], "frames from a skipped span")
+    assert min(ts) < 2.4 < 3.8 < max(ts), "the span should be cut out of the middle"
+    eq([list(map(float, s)) for s in rep["decode"]["spans"]], [[0.0, 2.4], [3.8, 8.0]],
+       "decode spans")
+    print(f"      decoded {len(ts)} frames, none in 2.4-3.8s")
+
+
+@test("e2e/frame-budget-spreads-over-selection")
+def t_budget(fresh=False):
+    p = build_clip("static", fresh)
+    rep = run_sr(p, "--roi", ",".join(map(str, roi_of(p))), "--use", "0-8",
+                 "--max-frames", 20, "--scale", 2, "--ibp", 1, "--no-variants")
+    ts = sorted(f["t"] for f in rep["frames"])
+    assert len(ts) <= 20, f"budget ignored: {len(ts)} frames"
+    assert ts[-1] - ts[0] > 6.0, f"frames bunched at the front: {ts[0]:.2f}-{ts[-1]:.2f}s"
+    print(f"      {len(ts)} frames spread over {ts[-1]-ts[0]:.1f}s")
+
+
+@test("e2e/cli-info-grid-select")
+def t_cli(fresh=False):
+    p = build_clip("static", fresh)
+    r = subprocess.run([PY, *TOOL, "info", p["path"]], capture_output=True, text=True, env=ENV)
+    eq(r.returncode, 0, "info")
+    assert "960x540" in r.stdout and "25.0000" in r.stdout, r.stdout
+
+    sheet = os.path.join(WORK, "sheet.png")
+    r = subprocess.run([PY, *TOOL, "grid", p["path"], "--start", "0", "--end", "4",
+                        "--count", "4", "--cols", "2", "--out", sheet],
+                       capture_output=True, text=True, env=ENV)
+    eq(r.returncode, 0, f"grid: {r.stderr}")
+    assert cv2.imread(sheet) is not None, "contact sheet unreadable"
+
+    work = os.path.join(WORK, "sel")
+    shutil.rmtree(work, ignore_errors=True)
+    r = subprocess.run([PY, *TOOL, "select", p["path"], "--start", "0", "--dur", "2",
+                        "--max-frames", "12", "--out", work],
+                       capture_output=True, text=True, env=ENV)
+    eq(r.returncode, 0, f"select: {r.stderr}")
+    page = os.path.join(work, "select.html")
+    html = open(page).read()
+    assert "data:image/jpeg;base64," in html, "frames not embedded"
+    assert '<script id="payload"' in html and "__DATA__" not in html, "payload not filled"
+    data = json.loads(html.split('type="application/json">')[1].split("</script>")[0])
+    nf = len(data["frames"])       # budget 12 over 50 frames -> stride 5 -> 10 kept
+    assert 8 <= nf <= 12, "embedded frames: %d" % nf
+    assert data["decode"]["spans"], "decode spans missing from the page"
+    print(f"      select.html {os.path.getsize(page)/1e6:.1f} MB, {len(data['frames'])} frames")
+
+
+@test("ui/picker-javascript-parses")
+def t_js():
+    """The picker UI can only be exercised in a browser, so at least prove the
+    generated page is syntactically valid JS and carries the data it needs."""
+    if not shutil.which("node"):
+        print("      skipped (no node)")
+        return
+    p = build_clip("static")
+    work = os.path.join(WORK, "sel_js")
+    shutil.rmtree(work, ignore_errors=True)
+    r = subprocess.run([PY, *TOOL, "select", p["path"], "--start", "0", "--dur", "1",
+                        "--max-frames", "6", "--out", work], capture_output=True, text=True, env=ENV)
+    eq(r.returncode, 0, f"select: {r.stderr}")
+    html = open(os.path.join(work, "select.html")).read()
+    body = html.split("</script>\n<script>")[-1].split("</script>")[0]
+    assert "function render()" in body, "main script not found"
+    stub = ("var document={getElementById:function(){return null},"
+            "createElement:function(){return {getContext:function(){return {}},"
+            "addEventListener:function(){},style:{},classList:{}}},"
+            "documentElement:{style:{setProperty:function(){}}}};\n")
+    js = os.path.join(WORK, "picker_check.js")
+    open(js, "w").write(stub + body)
+    chk = subprocess.run(["node", "--check", js], capture_output=True, text=True, env=ENV)
+    eq(chk.returncode, 0, f"picker JS syntax error:\n{chk.stderr}")
+    for hook in ("skip_spans", "exclude_times", "ref_time", "drawTimeline", "keepOf"):
+        assert hook in body, f"picker lost {hook}"
+    print("      picker JS parses, timeline + span export present")
+
+
+@test("e2e/selection-json-drives-sr")
+def t_selection(fresh=False):
+    """What the UI exports must reproduce end-to-end, spans and all."""
+    p = build_clip("static", fresh)
+    roi = roi_of(p)
+    sel = {
+        "version": ps.__version__, "video": p["path"],
+        "decode": {"spans": [[0.0, 8.0]], "window": None, "deint": "none",
+                   "step": 1, "max_frames": 60},
+        "window": [0, 0, p["width"], p["height"]], "roi": list(roi),
+        "ref_index": 0, "ref_time": 0.0, "fps": p["fps"],
+        "skip_spans": [[2.4, 3.8]],
+        "exclude_times": [5.0, 5.04], "exclude": [], "include": [],
+    }
+    path = os.path.join(WORK, "selection.json")
+    json.dump(sel, open(path, "w"), indent=2)
+    out = os.path.join(WORK, "out_sel")
+    shutil.rmtree(out, ignore_errors=True)
+    r = subprocess.run([PY, *TOOL, "sr", "--select", path, "--out", out,
+                        "--scale", "3", "--ibp", "2", "--no-variants"],
+                       capture_output=True, text=True, env=ENV)
+    eq(r.returncode, 0, f"sr --select failed:\n{r.stderr}")
+    rep = json.load(open(os.path.join(out, "report.json")))
+    eq(rep["roi"], list(roi), "roi from selection")
+    assert not [f["t"] for f in rep["frames"] if 2.4 < f["t"] < 3.8], "skip_spans ignored"
+    dropped = [f["t"] for f in rep["frames"] if not f["used"]]
+    assert any(abs(t - 5.0) < 0.05 for t in dropped), "exclude_times ignored"
+    assert os.path.exists(os.path.join(out, "review.html")), "no review page"
+    print(f"      {rep['frames_used']}/{rep['frames_decoded']} frames used via selection.json")
+
+
+# ---------------------------------------------------------------------------
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-k", "--filter", help="only run tests whose name contains this")
+    ap.add_argument("--fresh", action="store_true", help="re-encode the test clips")
+    ap.add_argument("--keep", action="store_true", help="keep the work directory")
+    ap.add_argument("-l", "--list", action="store_true")
+    a = ap.parse_args()
+
+    if a.list:
+        for name, _ in TESTS:
+            print(name)
+        return 0
+
+    picked = [(n, f) for n, f in TESTS if not a.filter or a.filter in n]
+    if not picked:
+        print(f"no test matches {a.filter!r}")
+        return 2
+    os.makedirs(WORK, exist_ok=True)
+
+    fails, t0 = [], time.time()
+    for name, fn in picked:
+        print(f"  {name} ...", flush=True)
+        t1 = time.time()
+        try:
+            fn(a.fresh) if fn.__code__.co_argcount else fn()
+            print(f"      PASS  ({time.time()-t1:.1f}s)")
+        except Exception as e:
+            fails.append((name, e))
+            print(f"      FAIL  {e}")
+            if os.environ.get("VIDSR_TRACE"):
+                traceback.print_exc()
+    dt = time.time() - t0
+    print(f"\n{len(picked)-len(fails)}/{len(picked)} passed in {dt:.1f}s")
+    for name, e in fails:
+        print(f"  FAILED {name}: {e}")
+    if not a.keep and not fails:
+        for d in os.listdir(WORK):
+            if d.startswith("out_") or d == "sel":
+                shutil.rmtree(os.path.join(WORK, d), ignore_errors=True)
+    else:
+        print(f"\nwork dir: {WORK}")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

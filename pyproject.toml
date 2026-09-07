@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vidsr"
+version = "0.1.0"
+description = "Multi-frame super-resolution for video: fuse many frames of one region into a single sharper image"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Philipp Herkert", email = "philippherkert@users.noreply.github.com" }]
+keywords = [
+    "super-resolution", "video", "multi-frame", "image-enhancement",
+    "forensics", "deconvolution", "image-registration", "cctv", "opencv",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Information Technology",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/BearlyStable/vidsr"
+Source = "https://github.com/BearlyStable/vidsr"
+Issues = "https://github.com/BearlyStable/vidsr/issues"
+
+[project.scripts]
+vidsr = "vidsr:main"
+
+[tool.setuptools]
+py-modules = ["vidsr"]
+
+[tool.setuptools.package-dir]
+"" = "src"

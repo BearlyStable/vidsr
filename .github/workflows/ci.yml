@@ -1,0 +1,55 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # the tool shells out to ffmpeg, and the tests encode their own clips
+      - name: install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: vidsr runs
+        run: vidsr --version
+
+      - name: tests
+        run: python tests/run_tests.py
+
+      - name: keep the reconstructions from a failed run
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vidsr-output-py${{ matrix.python-version }}
+          path: .testwork/
+          retention-days: 7
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*

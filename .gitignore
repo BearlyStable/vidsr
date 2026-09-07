@@ -1,0 +1,15 @@
+# build artefacts
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# local environments and scratch
+.venv/
+.testwork/
+
+# tool output
+out/
+work/
+selection.json

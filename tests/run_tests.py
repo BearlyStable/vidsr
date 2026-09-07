@@ -580,6 +580,117 @@ def t_progress(fresh=False):
           f"{rep['frames_used']} frames fused")
 
 
+class VirtualDisplay:
+    """A throwaway X server, so the window can be built and driven on a box
+    with no monitor. Yields None when the machine cannot provide one."""
+
+    def __init__(self):
+        self.proc = None
+        self.old = os.environ.get("DISPLAY")
+
+    def __enter__(self):
+        if self.old:
+            return self.old
+        if not shutil.which("Xvfb"):
+            return None
+        for n in range(99, 110):
+            if os.path.exists(f"/tmp/.X{n}-lock"):
+                continue
+            self.proc = subprocess.Popen(["Xvfb", f":{n}", "-screen", "0", "1400x900x24"],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(2.0)
+            if self.proc.poll() is None:
+                os.environ["DISPLAY"] = f":{n}"
+                return f":{n}"
+        return None
+
+    def __exit__(self, *exc):
+        if self.proc:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                self.proc.kill()
+        if self.old is None:
+            os.environ.pop("DISPLAY", None)
+        else:
+            os.environ["DISPLAY"] = self.old
+
+
+@test("ui/window-drives-a-reconstruction")
+def t_ui_window(fresh=False):
+    """Build the real window and drive it through Tk's own event system: drag an
+    ROI on the canvas, mark a span to ignore, press Run, and wait for the result
+    to land in the Result tab. Synthetic events rather than screen coordinates,
+    so it does not depend on where anything happens to be laid out."""
+    p = build_clip("static", fresh)
+    with VirtualDisplay() as display:
+        if not display:
+            print("      skipped (no display and no Xvfb)")
+            return
+        try:
+            import tkinter as tk
+        except ImportError:
+            print("      skipped (no tkinter)")
+            return
+        import vidsr_ui as ui
+
+        out = os.path.join(WORK, "out_uiwin")
+        shutil.rmtree(out, ignore_errors=True)
+        root = tk.Tk()
+        try:
+            app = ui.App(root, p["path"], out)
+            root.update()
+            assert app.info is not None, "the clip did not load"
+            assert app.disp is not None, "no frame was displayed"
+
+            # drag the region, in canvas coordinates derived from source pixels
+            roi = roi_of(p)
+            x0, y0 = ui.source_to_view(roi[0], roi[1], app.disp)
+            x1, y1 = ui.source_to_view(roi[0] + roi[2], roi[1] + roi[3], app.disp)
+            app.canvas.event_generate("<ButtonPress-1>", x=int(x0), y=int(y0))
+            app.canvas.event_generate("<B1-Motion>", x=int(x1), y=int(y1))
+            app.canvas.event_generate("<ButtonRelease-1>", x=int(x1), y=int(y1))
+            root.update()
+            got = app.sel.roi
+            assert got, "the drag produced no region"
+            for i, name in enumerate("xywh"):
+                assert abs(got[i] - roi[i]) <= 2, f"roi {name}: got {got}, drew {roi}"
+
+            # a span to ignore, and a shorter range, through the same widgets
+            app.add_skip(2.4, 3.8)
+            app.start_var.set("0.000")
+            app.end_var.set("6.000")
+            app.frames_var.set("40")
+            app.scale_var.set("2")
+            root.update()
+            eq(app.collect().spans(), [(0.0, 2.4), (3.8, 6.0)], "range minus the ignored span")
+
+            app.run()
+            deadline = time.time() + 240
+            while app.report is None and time.time() < deadline:
+                root.update()
+                time.sleep(0.1)
+                assert app.running or app.report, "the run ended without a report"
+            assert app.report, "the reconstruction never finished"
+
+            rep = app.report
+            assert os.path.exists(rep["outputs"]["result"]), "no result image"
+            assert not [f for f in rep["frames"] if 2.4 < f["t"] < 3.8], \
+                "frames from the ignored span were used"
+            assert max(f["t"] for f in rep["frames"]) <= 6.01, "range not honoured"
+            assert app.res_photo is not None, "the result was never shown in the window"
+            assert not app.running and str(app.run_btn["state"]) != "disabled", \
+                "Run stayed disabled after finishing"
+            print(f"      window ran {rep['frames_used']}/{rep['frames_decoded']} frames "
+                  f"and displayed the result")
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+
 @test("ui/imports-without-a-display")
 def t_ui_headless():
     """Importing the UI must not need Tk or a display: a headless box has to be

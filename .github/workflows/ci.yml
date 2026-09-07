@@ -20,9 +20,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      # the tool shells out to ffmpeg, and the tests encode their own clips
-      - name: install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      # ffmpeg because the tool shells out to it and the tests encode their own
+      # clips; xvfb so the Tk window can be built and driven without a monitor
+      - name: install ffmpeg and a virtual display
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg xvfb
 
       - name: install
         run: |

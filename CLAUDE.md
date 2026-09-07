@@ -25,11 +25,30 @@ python -m venv .venv && .venv/bin/pip install -e .
 
 Requires `ffmpeg`/`ffprobe` on PATH. Runtime deps are only numpy + OpenCV.
 `node` is optional (one test uses `node --check` on the generated HTML picker
-and skips without it). Tk is optional too: `vidsr ui` needs `python3-tk`, and
-prints how to install it when missing. **The Tk window itself cannot be tested
-here** — no display, and no Xvfb — so changes to widget wiring need the user to
-run `vidsr ui` and say what happened. Keep logic out of the widgets and in the
-pure helpers, which are tested.
+and skips without it). For the desktop UI you need `python3-tk` plus `Xvfb`:
+
+```bash
+sudo dnf install python3-tkinter xorg-x11-server-Xvfb xdotool   # Fedora
+sudo apt install python3-tk xvfb xdotool                        # Debian/Kali
+```
+
+With those, `ui/window-drives-a-reconstruction` builds the real window on a
+throwaway X server and drives it through Tk's own event system — dragging the
+region on the canvas, ignoring a span, pressing Run, waiting for the result to
+appear. Without them it skips. `xdotool` is not needed by the tests; it is for
+driving the window by hand when you want to *look* at it:
+
+```bash
+Xvfb :99 -screen 0 1400x900x24 &
+DISPLAY=:99 vidsr ui clip.mkv &
+DISPLAY=:99 import -window root shot.png     # then read the screenshot
+```
+
+Do that after any layout change. Two bugs got through review and were only
+visible in a screenshot: the action bar packed after a tall column fell off the
+bottom of the window, and the result canvas measured itself before its tab had
+ever been mapped, so the image rendered tiny in a corner. Neither raised an
+error anywhere.
 
 ## Working agreement
 
@@ -97,8 +116,11 @@ These were all found the hard way; a unit test guards each one.
 - **The UI has no second code path.** `vidsr_ui` builds a `vidsr sr ...`
   argument list and hands it to the real parser, which is what makes the window
   and the headless CLI equivalent. Do not let it call pipeline internals
-  directly — its geometry helpers are pure and tested, but nothing else about a
-  window can be checked automatically.
+  directly.
+- **Widgets hold no logic.** Geometry and argument building are pure functions
+  with their own tests; the window only wires them up. Anything you are tempted
+  to compute inside an event handler belongs outside it, where it can be tested
+  without a display.
 
 ## Domain facts worth keeping in mind
 

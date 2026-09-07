@@ -159,8 +159,8 @@ def _photo(bgr: np.ndarray):
 
 
 class App:
-    VIEW_W, VIEW_H = 780, 440
-    TL_H = 58
+    MIN_VIEW_W, MIN_VIEW_H = 480, 270
+    TL_H = 52
 
     def __init__(self, root, video: Optional[str], out: str):
         self.root = root
@@ -180,7 +180,13 @@ class App:
         self.report = None
 
         root.title("vidsr")
-        root.minsize(1100, 720)
+        # fit whatever screen this is: a 1366x768 laptop is not unusual, and a
+        # window taller than the display silently hides the Run button
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{min(1240, max(900, sw - 120))}x{min(880, max(600, sh - 120))}")
+        root.minsize(880, 560)
+        self.view_size = (self.MIN_VIEW_W, self.MIN_VIEW_H)
+        self.cur_frame = None
         self._build()
         if video:
             self.load(video)
@@ -194,6 +200,19 @@ class App:
         self.file_lbl = ttk.Label(top, text="no video loaded", foreground="#666")
         self.file_lbl.pack(side="left", padx=10)
 
+        # Pack the action bar against the bottom *before* the notebook claims
+        # the leftover space, or a tall control column pushes Run off-screen.
+        bar = ttk.Frame(self.root, padding=(10, 8))
+        bar.pack(side="bottom", fill="x")
+        ttk.Label(bar, text="zoom").pack(side="left")
+        self.scale_var = tk.StringVar(value="4")
+        ttk.Combobox(bar, textvariable=self.scale_var, width=4, state="readonly",
+                     values=["2", "3", "4", "6", "8"]).pack(side="left", padx=(4, 12))
+        ttk.Label(bar, text="frames").pack(side="left")
+        self.frames_var = tk.StringVar(value="300")
+        ttk.Spinbox(bar, textvariable=self.frames_var, from_=10, to=2000,
+                    increment=10, width=6).pack(side="left", padx=(4, 14))
+
         self.nb = ttk.Notebook(self.root)
         self.nb.pack(fill="both", expand=True, padx=10)
         self.tab_sel = ttk.Frame(self.nb)
@@ -202,9 +221,6 @@ class App:
         self.nb.add(self.tab_res, text="  Result  ")
         self._build_select(self.tab_sel)
         self._build_result(self.tab_res)
-
-        bar = ttk.Frame(self.root, padding=(10, 8))
-        bar.pack(fill="x")
         self.run_btn = ttk.Button(bar, text="Run reconstruction", command=self.run)
         self.run_btn.pack(side="left")
         ttk.Button(bar, text="Copy CLI command", command=self.copy_cmd).pack(side="left", padx=6)
@@ -214,12 +230,15 @@ class App:
         self.status.pack(side="left")
 
     def _build_select(self, parent):
+        right = ttk.Frame(parent, padding=(10, 6))
+        right.pack(side="right", fill="y")          # fixed column, packed first
         left = ttk.Frame(parent)
-        left.pack(side="left", fill="both", expand=True, pady=8)
-        self.canvas = tk.Canvas(left, width=self.VIEW_W, height=self.VIEW_H,
+        left.pack(side="left", fill="both", expand=True, pady=6)
+        self.canvas = tk.Canvas(left, width=self.MIN_VIEW_W, height=self.MIN_VIEW_H,
                                 bg="#111", highlightthickness=1,
                                 highlightbackground="#444", cursor="crosshair")
-        self.canvas.pack()
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", self._canvas_resized)
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_move)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
@@ -245,10 +264,7 @@ class App:
                   text="drag on the timeline = set the range to use   ·   "
                        "shift+drag = mark a span to ignore   ·   click = seek").pack(anchor="w", pady=(3, 0))
 
-        right = ttk.Frame(parent, padding=(12, 8))
-        right.pack(side="left", fill="y")
-
-        g = ttk.LabelFrame(right, text="Range to use", padding=8)
+        g = ttk.LabelFrame(right, text="Range to use", padding=6)
         g.pack(fill="x")
         self.start_var, self.end_var = tk.StringVar(value="0"), tk.StringVar(value="0")
         row = ttk.Frame(g); row.pack(fill="x")
@@ -266,44 +282,33 @@ class App:
         for v in (self.start_var, self.end_var):
             v.trace_add("write", lambda *_: self.sync_range())
 
-        g = ttk.LabelFrame(right, text="Spans to ignore", padding=8)
-        g.pack(fill="x", pady=(10, 0))
-        self.skip_list = tk.Listbox(g, height=4, activestyle="none")
+        g = ttk.LabelFrame(right, text="Spans to ignore", padding=6)
+        g.pack(fill="x", pady=(8, 0))
+        self.skip_list = tk.Listbox(g, height=3, activestyle="none")
         self.skip_list.pack(fill="x")
         row = ttk.Frame(g); row.pack(fill="x", pady=(5, 0))
         self.skip_btn = ttk.Button(row, text="Start ignoring here", command=self.mark_skip)
         self.skip_btn.pack(side="left")
         ttk.Button(row, text="Remove", command=self.remove_skip).pack(side="left", padx=4)
 
-        g = ttk.LabelFrame(right, text="Subject", padding=8)
-        g.pack(fill="x", pady=(10, 0))
+        g = ttk.LabelFrame(right, text="Subject", padding=6)
+        g.pack(fill="x", pady=(8, 0))
         self.preset_var = tk.StringVar(value="static")
         for val, txt in (("static", "Still (parked car, fixed camera)"),
                          ("moving", "Moving through the frame"),
                          ("auto", "Neither / let me tune it")):
             ttk.Radiobutton(g, text=txt, value=val, variable=self.preset_var).pack(anchor="w")
 
-        g = ttk.LabelFrame(right, text="Region", padding=8)
-        g.pack(fill="x", pady=(10, 0))
+        g = ttk.LabelFrame(right, text="Region", padding=6)
+        g.pack(fill="x", pady=(8, 0))
         self.roi_lbl = ttk.Label(g, text="drag a box on the frame", foreground="#666")
         self.roi_lbl.pack(anchor="w")
-        self.roi_canvas = tk.Canvas(g, width=250, height=90, bg="#111",
+        self.roi_canvas = tk.Canvas(g, width=236, height=72, bg="#111",
                                     highlightthickness=1, highlightbackground="#444")
         self.roi_canvas.pack(pady=(5, 0))
         ttk.Button(g, text="Clear", command=self.clear_roi).pack(anchor="w", pady=(5, 0))
 
-        g = ttk.LabelFrame(right, text="Output", padding=8)
-        g.pack(fill="x", pady=(10, 0))
-        row = ttk.Frame(g); row.pack(fill="x")
-        ttk.Label(row, text="zoom", width=6).pack(side="left")
-        self.scale_var = tk.StringVar(value="4")
-        ttk.Combobox(row, textvariable=self.scale_var, width=5, state="readonly",
-                     values=["2", "3", "4", "6", "8"]).pack(side="left")
-        row = ttk.Frame(g); row.pack(fill="x", pady=(4, 0))
-        ttk.Label(row, text="frames", width=6).pack(side="left")
-        self.frames_var = tk.StringVar(value="300")
-        ttk.Spinbox(row, textvariable=self.frames_var, from_=10, to=2000,
-                    increment=10, width=7).pack(side="left")
+
 
     def _build_result(self, parent):
         bar = ttk.Frame(parent, padding=(8, 8))
@@ -320,6 +325,11 @@ class App:
         self.res_lbl.pack(anchor="w")
         self.res_canvas = tk.Canvas(parent, bg="#111", highlightthickness=0)
         self.res_canvas.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        # The tab has never been mapped when the first result arrives, so the
+        # canvas still reports 1x1 and the image would be drawn tiny. Re-render
+        # once it actually has a size, and on every resize after that.
+        self.res_canvas.bind("<Configure>", self._result_resized)
+        self.res_size = (0, 0)
 
     # -- video -------------------------------------------------------------
     def pick_file(self):
@@ -372,9 +382,19 @@ class App:
         self.show_frame(self.frame_cache[key])
         self.draw_timeline()
 
+    def _canvas_resized(self, e):
+        size = (max(self.MIN_VIEW_W, e.width), max(self.MIN_VIEW_H, e.height))
+        if size == self.view_size:
+            return
+        self.view_size = size
+        if self.cur_frame is not None:
+            self.show_frame(self.cur_frame)
+
     def show_frame(self, bgr):
+        self.cur_frame = bgr
         h, w = bgr.shape[:2]
-        s, ox, oy = fit_view(w, h, self.VIEW_W, self.VIEW_H)
+        vw, vh = self.view_size
+        s, ox, oy = fit_view(w, h, vw, vh)
         img = cv2.resize(bgr, (max(1, int(w * s)), max(1, int(h * s))),
                          interpolation=cv2.INTER_AREA)
         self.disp = (s, ox, oy)
@@ -382,6 +402,10 @@ class App:
         self.canvas.delete("all")
         self.canvas.create_image(ox, oy, anchor="nw", image=self.photo)
         self.draw_roi()
+
+    def _roi_preview_size(self):
+        return (int(self.roi_canvas.winfo_width() or 236),
+                int(self.roi_canvas.winfo_height() or 72))
 
     def step(self, n: int):
         if self.info:
@@ -431,11 +455,12 @@ class App:
         if key in self.frame_cache:
             crop = self.frame_cache[key][y:y + h, x:x + w]
             if crop.size:
-                z = max(1, min(250 // max(1, w), 90 // max(1, h), 12))
+                pw, ph = self._roi_preview_size()
+                z = max(1, min(pw // max(1, w), ph // max(1, h), 12))
                 big = cv2.resize(crop, (w * z, h * z), interpolation=cv2.INTER_NEAREST)
                 self.roi_photo = _photo(big)
                 self.roi_canvas.delete("all")
-                self.roi_canvas.create_image(125, 45, image=self.roi_photo)
+                self.roi_canvas.create_image(pw // 2, ph // 2, image=self.roi_photo)
 
     def clear_roi(self):
         self.sel.roi = None
@@ -636,6 +661,12 @@ class App:
         return outs.get({"result": "result", "compare": "compare",
                          "variants": "variants"}[self.view_var.get()]) or outs.get("result")
 
+    def _result_resized(self, e):
+        size = (e.width, e.height)
+        if size != self.res_size and self.report:
+            self.res_size = size
+            self.show_result()
+
     def show_result(self):
         p = self.result_path()
         if not p or not os.path.exists(p):
@@ -646,7 +677,7 @@ class App:
         cw = max(400, self.res_canvas.winfo_width())
         ch = max(300, self.res_canvas.winfo_height())
         s = min(cw / img.shape[1], ch / img.shape[0])
-        if s > 1:                          # show small results big, but crisply
+        if s >= 2:      # a small result deserves the space, at whole-pixel steps
             img = cv2.resize(img, None, fx=int(s), fy=int(s),
                              interpolation=cv2.INTER_NEAREST)
         elif s < 1:

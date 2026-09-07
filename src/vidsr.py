@@ -58,6 +58,28 @@ def log(msg: str = "") -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+_PROGRESS = None
+
+
+def set_progress(cb) -> None:
+    """Install a callback(fraction, message) so a UI can follow a run.
+
+    The CLI leaves this unset and just logs; nothing in the pipeline changes
+    behaviour depending on whether anyone is listening.
+    """
+    global _PROGRESS
+    _PROGRESS = cb
+
+
+def progress(frac: float, msg: str) -> None:
+    if _PROGRESS is None:
+        return
+    try:
+        _PROGRESS(max(0.0, min(1.0, float(frac))), msg)
+    except Exception:
+        pass          # a broken UI must never take the reconstruction down
+
+
 def which_or_die(prog: str) -> str:
     p = shutil.which(prog)
     if not p:
@@ -203,6 +225,26 @@ def clamp_rect(r, W: int, H: int):
     return x, y, w, h
 
 
+def even_rect(r, W: int, H: int):
+    """Snap a crop rect to even offsets and even sizes.
+
+    ffmpeg's crop filter silently rounds odd sizes *down* on chroma-subsampled
+    pixel formats (yuv420p and friends): ask for 63x47 and you get 62x46, with
+    no warning. Reshaping the raw pipe at the requested width then slips every
+    row by a pixel and shears the whole picture into a parallelogram.
+    """
+    x, y, w, h = clamp_rect(r, W, H)
+    x -= x % 2
+    y -= y % 2
+    w += w % 2
+    h += h % 2
+    if x + w > W:                      # growing ran off the edge: shrink back
+        w = (W - x) - ((W - x) % 2)
+    if y + h > H:
+        h = (H - y) - ((H - y) % 2)
+    return (x, y, max(2, w), max(2, h))
+
+
 def expand_rect(r, pad_x: int, pad_y: int, W: int, H: int):
     x, y, w, h = r
     return clamp_rect((x - pad_x, y - pad_y, w + 2 * pad_x, h + 2 * pad_y), W, H)
@@ -275,6 +317,26 @@ def probe(path: str) -> VideoInfo:
     )
 
 
+_CROP_EXACT: Optional[bool] = None
+
+
+def crop_supports_exact() -> bool:
+    """Whether this ffmpeg's crop filter has `exact`.
+
+    Without it, crop snaps odd sizes *and* odd offsets down to even on
+    subsampled formats, so the ROI you asked for is not the ROI you get.
+    """
+    global _CROP_EXACT
+    if _CROP_EXACT is None:
+        try:
+            out = subprocess.run(["ffmpeg", "-hide_banner", "-h", "filter=crop"],
+                                 capture_output=True, text=True, timeout=20)
+            _CROP_EXACT = " exact " in out.stdout
+        except Exception:
+            _CROP_EXACT = False
+    return _CROP_EXACT
+
+
 DEINT_FILTERS = {
     "none": None,
     # one output frame per input frame
@@ -321,7 +383,8 @@ class DecodeSpec:
                           max_frames=d.get("max_frames"))
 
 
-def ffmpeg_cmd(info: VideoInfo, spec: DecodeSpec, span: tuple[float, float]) -> list[str]:
+def ffmpeg_cmd(info: VideoInfo, spec: DecodeSpec, span: tuple[float, float],
+               still: bool = False) -> list[str]:
     which_or_die("ffmpeg")
     start, end = span
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
@@ -337,11 +400,44 @@ def ffmpeg_cmd(info: VideoInfo, spec: DecodeSpec, span: tuple[float, float]) -> 
         vf.append(df)
     if spec.window:
         x, y, w, h = spec.window
-        vf.append(f"crop={w}:{h}:{x}:{y}")
+        exact = ":exact=1" if crop_supports_exact() else ""
+        vf.append(f"crop={w}:{h}:{x}:{y}{exact}")
     if vf:
         cmd += ["-vf", ",".join(vf)]
-    cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    if still:
+        # one self-describing frame, so its real dimensions can be read back
+        cmd += ["-frames:v", "1", "-f", "image2pipe", "-c:v", "bmp", "-"]
+    else:
+        cmd += ["-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
     return cmd
+
+
+_SIZE_CACHE: dict = {}
+
+
+def probe_filtered_size(info: VideoInfo, spec: DecodeSpec) -> tuple[int, int]:
+    """The (width, height) the filter chain really emits.
+
+    Never assume it matches the request: crop rounding on subsampled formats,
+    rotation metadata and anamorphic SAR all change it, and guessing wrong
+    shears every frame silently. One extra decoded frame is cheap insurance.
+    """
+    key = (info.path, spec.deint, spec.window)
+    if key in _SIZE_CACHE:
+        return _SIZE_CACHE[key]
+    want = (spec.window[2], spec.window[3]) if spec.window else (info.width, info.height)
+    span = spec.spans[0] if spec.spans else (0.0, 1.0)
+    size = want
+    try:
+        out = subprocess.run(ffmpeg_cmd(info, spec, span, still=True),
+                             capture_output=True, timeout=60).stdout
+        img = cv2.imdecode(np.frombuffer(out, np.uint8), cv2.IMREAD_COLOR)
+        if img is not None and img.size:
+            size = (int(img.shape[1]), int(img.shape[0]))
+    except Exception:
+        pass
+    _SIZE_CACHE[key] = size
+    return size
 
 
 def effective_fps(info: VideoInfo, spec: DecodeSpec) -> float:
@@ -362,7 +458,11 @@ def plan_stride(info: VideoInfo, spec: DecodeSpec) -> int:
 
 def decode(info: VideoInfo, spec: DecodeSpec) -> Iterator[tuple[int, float, np.ndarray]]:
     """Stream (index, absolute timestamp, BGR frame) across every span."""
-    w, h = (spec.window[2], spec.window[3]) if spec.window else (info.width, info.height)
+    want = (spec.window[2], spec.window[3]) if spec.window else (info.width, info.height)
+    w, h = probe_filtered_size(info, spec)
+    if (w, h) != want:
+        log(f"note     ffmpeg emits {w}x{h}, not the requested {want[0]}x{want[1]}; "
+            f"using the real size (odd crops get rounded on subsampled formats)")
     fps = effective_fps(info, spec)
     nbytes = w * h * 3
     spans = spec.spans or [(0.0, info.duration or 0.0)]
@@ -726,7 +826,7 @@ def gauss_blur(img: np.ndarray, sigma: float) -> np.ndarray:
 def back_project(hr: np.ndarray, obs: list[np.ndarray], warps: list[np.ndarray],
                  T: np.ndarray, weights: np.ndarray, iters: int, psf_sigma: float,
                  lam: float = 0.7, clip_k: float = 3.0,
-                 progress: bool = True) -> np.ndarray:
+                 verbose: bool = True) -> np.ndarray:
     """Refine the HR estimate so it reproduces every observed LR frame.
 
     This is what actually pulls detail out of the stack: the fused image is only
@@ -765,7 +865,8 @@ def back_project(hr: np.ndarray, obs: list[np.ndarray], warps: list[np.ndarray],
         upd = acc / np.maximum(wacc, 1e-6)
         upd = gauss_blur(upd, max(0.5, psf_sigma * 0.8))
         X = np.clip(X + lam * upd, 0.0, 1.0)
-        if progress:
+        progress(0.62 + 0.22 * (it + 1) / iters, f"back-projection {it + 1}/{iters}")
+        if verbose:
             log(f"    back-projection {it + 1}/{iters}  rms={float(np.sqrt((upd ** 2).mean())):.5f}")
     return X
 
@@ -1455,12 +1556,13 @@ def cmd_select(a) -> int:
     spans = resolve_spans(a, info, 4.0)
     window = (0, 0, info.width, info.height)
     if a.window:
-        window = clamp_rect(parse_rect(a.window), info.width, info.height)
+        window = even_rect(parse_rect(a.window), info.width, info.height)
     roi = clamp_rect(parse_rect(a.roi), info.width, info.height) if a.roi else None
     if roi and not a.window:
         # give the aligner room around the subject and the user room for context
         pad = a.pad if a.pad is not None else max(48, int(0.9 * max(roi[2], roi[3])))
-        window = expand_rect(roi, pad, pad, info.width, info.height)
+        window = even_rect(expand_rect(roi, pad, pad, info.width, info.height),
+                           info.width, info.height)
 
     spec = DecodeSpec(spans=spans, window=window, deint=a.deint,
                       step=a.step, max_frames=a.max_frames)
@@ -1583,7 +1685,8 @@ def _resolve_job(a):
     # cropping does not change frame indexing, so it is always safe to shrink the
     # decode window to the ROI plus its alignment context
     pad = a.pad if a.pad is not None else max(32, int(0.6 * max(roi[2], roi[3])))
-    spec.window = expand_rect(roi, pad, pad, info.width, info.height)
+    spec.window = even_rect(expand_rect(roi, pad, pad, info.width, info.height),
+                            info.width, info.height)
     return info, spec, spec.window, roi, ref, excluded, ref_time, exclude_times
 
 
@@ -1620,10 +1723,21 @@ def cmd_sr(a) -> int:
     log(f"decode   {fmt_spans(spec.spans)}  ({spec.total:.1f}s, stride {plan_stride(info, spec)},"
         f" deint={spec.deint})")
 
+    progress(0.02, "decoding frames")
     frames, times = read_frames(info, spec)
     n = len(frames)
+    progress(0.18, f"{n} frames decoded")
     if n < 2:
         die("need at least 2 frames; widen --dur")
+    # the decoded frames are the authority on the window's real size
+    fh, fw = frames[0].shape[:2]
+    if (fw, fh) != (ww, wh):
+        window = (wx, wy, fw, fh)
+        ww, wh = fw, fh
+        spec.window = window
+    roi_in_win = clamp_rect((roi[0] - wx, roi[1] - wy, roi[2], roi[3]), ww, wh)
+    if roi_in_win[2] < roi[2] or roi_in_win[3] < roi[3]:
+        log(f"note     ROI clipped to the decode window ({roi_in_win[2]}x{roi_in_win[3]})")
     log(f"frames   {n} decoded")
 
     # ---- reference -------------------------------------------------------
@@ -1656,6 +1770,7 @@ def cmd_sr(a) -> int:
     order = sorted(range(n), key=lambda i: abs(i - ref_idx))  # outward from the reference
     warps: dict[int, np.ndarray] = {}
     rhos: dict[int, float] = {}
+    done = 0
     for i in order:
         if i == ref_idx:
             W = np.eye(3, dtype=np.float32)[:2] if a.motion != "homography" else np.eye(3, dtype=np.float32)
@@ -1669,6 +1784,9 @@ def cmd_sr(a) -> int:
             W, rho = (np.eye(3, dtype=np.float32)[:2] if a.motion != "homography"
                       else np.eye(3, dtype=np.float32)), -1.0
         warps[i], rhos[i] = W, rho
+        done += 1
+        if done % 5 == 0 or done == n:
+            progress(0.18 + 0.37 * done / max(1, n), f"aligning {done}/{n}")
         if a.verbose:
             log(f"    #{i:<4d} rho={rho:+.3f} dx={float(W[0, 2]):+.2f} dy={float(W[1, 2]):+.2f}")
 
@@ -1767,6 +1885,7 @@ def cmd_sr(a) -> int:
         weights[k] = max(0.05, r.ncc) * min(1.0, r.sharp / smed) ** 0.5
     weights /= weights.mean()
 
+    progress(0.58, f"fusing {len(used)} frames")
     fused, coverage = fuse_stack(stack, weights, a.fusion, a.trim)
     del stack
     thin = float((coverage < 1).mean())
@@ -1779,6 +1898,7 @@ def cmd_sr(a) -> int:
     if a.ibp > 0:
         log(f"refining  iterative back-projection x{a.ibp} (psf sigma {psf:.2f})")
         hr = back_project(fused, obs, wlist, T, weights, a.ibp, psf, a.lam)
+    progress(0.86, "deconvolving")
     sharpened = richardson_lucy(hr, psf * a.rl_psf_scale, a.rl)
     final = unsharp(sharpened, max(0.6, psf * 0.7), a.unsharp)
     if a.denoise > 0:
@@ -1791,6 +1911,7 @@ def cmd_sr(a) -> int:
         final = cv2.cvtColor(to_u8(final), cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
 
     # ---- outputs ---------------------------------------------------------
+    progress(0.92, "writing output")
     rx, ry, rw2, rh2 = roi_out
     ref_crop = frames[ref_idx][ry:ry + rh2, rx:rx + rw2].astype(np.float32) / 255.0
     bicubic = cv2.resize(ref_crop, hr_size, interpolation=cv2.INTER_CUBIC)
@@ -1898,6 +2019,7 @@ def cmd_sr(a) -> int:
         print(f"\nnote: sub-pixel phase coverage is only {phase_cov * 100:.0f}% - the object barely "
               f"moved between frames,\n      so extra frames mainly cut noise. A longer --dur (more "
               f"motion) usually helps more than a higher --scale.")
+    progress(1.0, f"done in {_time.time() - t0:.1f}s")
     log(f"done in {_time.time() - t0:.1f}s")
     return 0
 

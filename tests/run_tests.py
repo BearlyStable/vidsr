@@ -239,6 +239,66 @@ def t_specjson():
 # ---------------------------------------------------------------------------
 
 
+@test("e2e/odd-sized-window-never-shears")
+def t_odd_crop(fresh=False):
+    """ffmpeg's crop filter rounds odd sizes down to even on chroma-subsampled
+    formats. Reshaping the pipe at the *requested* width then slips every row by
+    a pixel and shears the picture into a parallelogram - silently, with no
+    error anywhere. Decoded frames must match the same region of a full-frame
+    decode no matter what size was asked for."""
+    p = build_clip("static", fresh)
+    info = ps.probe(p["path"])
+    full, _ = ps.read_frames(info, ps.DecodeSpec(spans=[(0.0, 0.2)], max_frames=1))
+    ref_frame = full[0]
+    worst_mad, worst_shift, checked = 0.0, 0.0, 0
+    for win in [(100, 74, 64, 48),      # even, flat wall
+                (101, 75, 63, 47),      # odd size and odd offset, flat wall
+                (452, 372, 55, 19),     # odd size, over the plate (textured)
+                (453, 373, 55, 19),     # odd size and offset, over the plate
+                (51, 51, 33, 21)]:      # odd everything
+        got, _ = ps.read_frames(info, ps.DecodeSpec(spans=[(0.0, 0.2)], window=win,
+                                                    max_frames=1))
+        crop = got[0]
+        h, w = crop.shape[:2]
+        x, y = win[0], win[1]
+        assert (w, h) == (win[2], win[3]), f"{win}: got {w}x{h}, asked {win[2]}x{win[3]}"
+        ref = ref_frame[y:y + h, x:x + w]
+        g_ref, g_got = ps.to_gray32(ref), ps.to_gray32(crop)
+
+        # A shear puts row k off by k pixels, which wrecks both of these.
+        mad = float(np.abs(g_ref - g_got).mean())
+        dx, dy, _ = ps.phase_shift(ps.prep_for_align(g_ref), ps.prep_for_align(g_got))
+        assert mad < 0.02, f"window {win} decoded wrong (mean abs diff {mad:.4f})"
+        assert abs(dx) < 0.5 and abs(dy) < 0.5, f"window {win} offset by ({dx:.2f},{dy:.2f})"
+
+        # correlation is only meaningful where there is something to correlate;
+        # on a flat wall it measures chroma-resampling noise, not geometry
+        if float(g_ref.std()) > 0.02:
+            r = ps.ncc(g_ref, g_got, np.ones(g_ref.shape, bool))
+            assert r > 0.98, f"window {win} decoded sheared (ncc {r:.3f})"
+            checked += 1
+        worst_mad = max(worst_mad, mad)
+        worst_shift = max(worst_shift, abs(dx), abs(dy))
+    assert checked >= 2, "test bug: no textured window exercised"
+    print(f"      5 windows incl. odd sizes/offsets: worst diff {worst_mad:.4f}, "
+          f"worst shift {worst_shift:.2f}px")
+
+
+@test("e2e/odd-roi-reconstructs-correctly")
+def t_odd_roi(fresh=False):
+    """The same failure end to end: an odd-sized ROI must still beat bicubic."""
+    p = build_clip("static", fresh)
+    x, y, w, h = roi_of(p)
+    odd = (x + 1, y + 1, w - 1, h - 1)          # force odd width and height
+    assert odd[2] % 2 == 1 and odd[3] % 2 == 1, "test bug: roi is not odd"
+    rep = run_sr(p, "--roi", ",".join(map(str, odd)), "--preset", "static",
+                 "--scale", 4, "--use", "0-6", "--max-frames", 90, "--ibp", 6,
+                 "--no-variants", out=os.path.join(WORK, "out_oddroi"))
+    base, fused, final = scores(p, rep)
+    print(f"      odd roi {odd}: bicubic {base:.3f} -> result {final:.3f}")
+    ge(final, base + 0.008, "odd ROI must reconstruct as well as an even one")
+
+
 @test("e2e/static-parked-car")
 def t_static(fresh=False):
     p = build_clip("static", fresh)

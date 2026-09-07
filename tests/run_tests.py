@@ -255,7 +255,8 @@ def t_odd_crop(fresh=False):
                 (101, 75, 63, 47),      # odd size and odd offset, flat wall
                 (452, 372, 55, 19),     # odd size, over the plate (textured)
                 (453, 373, 55, 19),     # odd size and offset, over the plate
-                (51, 51, 33, 21)]:      # odd everything
+                (451, 371, 59, 23),     # odd everything, around the plate
+                (51, 51, 33, 21)]:      # odd everything, road
         got, _ = ps.read_frames(info, ps.DecodeSpec(spans=[(0.0, 0.2)], window=win,
                                                     max_frames=1))
         crop = got[0]
@@ -265,23 +266,26 @@ def t_odd_crop(fresh=False):
         ref = ref_frame[y:y + h, x:x + w]
         g_ref, g_got = ps.to_gray32(ref), ps.to_gray32(crop)
 
-        # A shear puts row k off by k pixels, which wrecks both of these.
+        # A shear puts row k off by k pixels, which wrecks all of these.
         mad = float(np.abs(g_ref - g_got).mean())
-        dx, dy, _ = ps.phase_shift(ps.prep_for_align(g_ref), ps.prep_for_align(g_got))
         assert mad < 0.02, f"window {win} decoded wrong (mean abs diff {mad:.4f})"
-        assert abs(dx) < 0.5 and abs(dy) < 0.5, f"window {win} offset by ({dx:.2f},{dy:.2f})"
+        worst_mad = max(worst_mad, mad)
 
-        # correlation is only meaningful where there is something to correlate;
-        # on a flat wall it measures chroma-resampling noise, not geometry
+        # Correlation and sub-pixel shift are only meaningful where there is
+        # something to correlate. On a flat wall they measure chroma-resampling
+        # noise: this patch reads -0.19px under one H.264 encoder and +0.65px
+        # under another, neither of which says anything about geometry. Size and
+        # mean difference are what a featureless window can honestly assert.
         if float(g_ref.std()) > 0.02:
             r = ps.ncc(g_ref, g_got, np.ones(g_ref.shape, bool))
             assert r > 0.98, f"window {win} decoded sheared (ncc {r:.3f})"
+            dx, dy, _ = ps.phase_shift(ps.prep_for_align(g_ref), ps.prep_for_align(g_got))
+            assert abs(dx) < 0.5 and abs(dy) < 0.5, f"window {win} offset by ({dx:.2f},{dy:.2f})"
+            worst_shift = max(worst_shift, abs(dx), abs(dy))
             checked += 1
-        worst_mad = max(worst_mad, mad)
-        worst_shift = max(worst_shift, abs(dx), abs(dy))
-    assert checked >= 2, "test bug: no textured window exercised"
-    print(f"      5 windows incl. odd sizes/offsets: worst diff {worst_mad:.4f}, "
-          f"worst shift {worst_shift:.2f}px")
+    assert checked >= 3, "test bug: too few textured windows to prove geometry"
+    print(f"      6 windows incl. odd sizes/offsets: worst diff {worst_mad:.4f}, "
+          f"worst shift {worst_shift:.2f}px over {checked} textured ones")
 
 
 @test("e2e/odd-roi-reconstructs-correctly")

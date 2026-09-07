@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — unreleased
+## 0.1.0 — 2026-09-07
 
 First public release. Alpha: the pipeline is tested end to end against a
 synthetic ground truth, but it has been exercised on few real cameras, and the
